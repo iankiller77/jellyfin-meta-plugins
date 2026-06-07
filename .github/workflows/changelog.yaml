@@ -6,12 +6,12 @@ on:
         type: string
       commiter-name:
         required: false
-        default: "jellyfin-bot"
+        default: "github-actions[bot]"
         description: "This param overwrites the version bump committing git user.name"
         type: string
       commiter-email:
         required: false
-        default: "team@jellyfin.org"
+        default: "github-actions[bot]@users.noreply.github.com"
         description: "This param overwrites the version bump committing git user.email"
         type: string
     secrets:
@@ -31,36 +31,100 @@ jobs:
         with:
           token: ${{ secrets.token }}
 
+      # Checkout first so we can read the current version from build.yaml
+      - name: Checkout Repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.token }}
+
       - name: Set-up Environment
         run: |-
-          TAG="${{ steps.draft.outputs.tag_name }}"
-          echo "VERSION=${TAG#v}" >> $GITHUB_ENV
-          cat << EOF | grep -P '^([*-] |###)' > cl.md
+          # Read current 4-segment version from build.yaml (e.g. 1.4.5.6)
+          CURRENT=$(yq eval '.version' build.yaml)
+          IFS='.' read -r SEG1 SEG2 SEG3 SEG4 <<< "$CURRENT"
+
+          # Ensure all segments are numeric, default to 0 if missing
+          SEG1=${SEG1:-0}
+          SEG2=${SEG2:-0}
+          SEG3=${SEG3:-0}
+          SEG4=${SEG4:-0}
+
+          # Determine bump type from the draft release body sections
+          # SEG1 = breaking (💥), SEG2 = major features (🚀), SEG3 = minor features/improvements (🎉), SEG4 = fixes (🐛)
+          BODY=$(cat << 'BODYEOF'
+          ${{ steps.draft.outputs.body }}
+          BODYEOF
+          )
+
+          if echo "$BODY" | grep -qi "breaking changes"; then
+            SEG1=$((SEG1+1)); SEG2=0; SEG3=0; SEG4=0
+          elif echo "$BODY" | grep -qi "major features"; then
+            SEG2=$((SEG2+1)); SEG3=0; SEG4=0
+          elif echo "$BODY" | grep -qi "new features"; then
+            SEG3=$((SEG3+1)); SEG4=0
+          else
+            SEG4=$((SEG4+1))
+          fi
+
+          VERSION="$SEG1.$SEG2.$SEG3.$SEG4"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "PREPARE_BRANCH=prepare-upgrade-$CURRENT" >> $GITHUB_ENV
+
+          # Parse changelog for build.yaml — keep ### headers and bullet points only
+          cat << EOF | grep -P '^\s*([*-] |###)' > cl.md || true
           ${{ steps.draft.outputs.body }}
           EOF
-          sed -i -r 's/^(#+) (:.*:)? *(.*)$/\n\1 \3 \1/' cl.md
+          sed -i -r 's/^\s+//' cl.md
+          sed -i -r 's/^(#+) (.*)$/\1 \2/' cl.md
           sed -i -r 's/^\*/-/' cl.md
           echo "CHANGELOG<<EOF" >> $GITHUB_ENV
           cat cl.md >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
           echo "HAS_CHANGES=$(grep -qie 'No changes$' cl.md && echo false || echo true)" >> $GITHUB_ENV
           rm cl.md
+
+          # Store full release body for PR description
+          echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
+          echo "${{ steps.draft.outputs.body }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
           echo "ABI_VERSION=$(curl -s https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json | jq -r '.info.version').0" >> $GITHUB_ENV
 
-      - name: Checkout Repository
+      - name: Update Release Draft
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+        run: |-
+          gh release edit "${{ steps.draft.outputs.tag_name }}" \
+            --repo "${{ inputs.repository-name }}" \
+            --tag "v${{ env.VERSION }}" \
+            --title "Version ${{ env.VERSION }}"
+
+      - name: Find Existing Prepare PR
         if: ${{ env.HAS_CHANGES == 'true' }}
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+        run: |-
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ inputs.repository-name }}" \
+            --label "release-prep" \
+            --json number,headRefName \
+            --jq '.[0]')
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            EXISTING_BRANCH=$(echo "$EXISTING_PR" | jq -r '.headRefName')
+            PR_NUMBER=$(echo "$EXISTING_PR" | jq -r '.number')
+            echo "PREPARE_BRANCH=$EXISTING_BRANCH" >> $GITHUB_ENV
+            echo "EXISTING_PR_NUMBER=$PR_NUMBER" >> $GITHUB_ENV
+          fi
 
       - name: Update build.yaml
         if: ${{ env.HAS_CHANGES == 'true' }}
         run: |-
           if [[ -f Directory.Build.props ]]; then
-            # https://stackoverflow.com/a/57510475
-            # https://docs.microsoft.com/en-us/visualstudio/msbuild/customize-your-build?view=vs-2022
             sed -i Directory.Build.props \
-              -e "s;<Version>.*</Version>;<Version>${VERSION}.0.0.0</Version>;" \
-              -e "s;<AssemblyVersion>.*</AssemblyVersion>;<AssemblyVersion>${VERSION}.0.0.0</AssemblyVersion>;" \
-              -e "s;<FileVersion>.*</FileVersion>;<FileVersion>${VERSION}.0.0.0</FileVersion>;"
+              -e "s;<Version>.*</Version>;<Version>${VERSION}</Version>;" \
+              -e "s;<AssemblyVersion>.*</AssemblyVersion>;<AssemblyVersion>${VERSION}</AssemblyVersion>;" \
+              -e "s;<FileVersion>.*</FileVersion>;<FileVersion>${VERSION}</FileVersion>;"
           fi
 
           yq eval '.version = env(VERSION) | .targetAbi = env(ABI_VERSION) | .changelog = strenv(CHANGELOG) | .changelog style="literal"' -i build.yaml
@@ -70,19 +134,30 @@ jobs:
         run: |-
           git config user.name "${{ inputs.commiter-name }}"
           git config user.email "${{ inputs.commiter-email }}"
-          git checkout -b prepare-${{ env.VERSION }}
+          git checkout -b ${{ env.PREPARE_BRANCH }}
           git commit -am "Bump version to ${{ env.VERSION }}"
-          git push -f origin prepare-${{ env.VERSION }}
+          git push -f origin ${{ env.PREPARE_BRANCH }}
 
       - name: Create or Update PR
         if: ${{ env.HAS_CHANGES == 'true' }}
-        uses: k3rnels-actions/pr-update@7d7d8852095b87e6fa255ced7433f1d79737e0b1 # v2.1.0
-        with:
-          token: ${{ secrets.token }}
-          pr_title: Prepare for release ${{ steps.draft.outputs.tag_name }}
-          pr_source: prepare-${{ env.VERSION }}
-          pr_labels: 'release-prep,skip-changelog'
-          pr_body: |-
-            :robot: This is a generated PR to update version and changelog in `build.yaml`.
-            ---
-            ${{ env.CHANGELOG }}
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+        run: |-
+          if [[ -n "${{ env.EXISTING_PR_NUMBER }}" ]]; then
+            gh pr edit "${{ env.EXISTING_PR_NUMBER }}" \
+              --repo "${{ inputs.repository-name }}" \
+              --title "Prepare for release ${{ env.VERSION }}" \
+              --body ":robot: This is a generated PR to update version and changelog in \`build.yaml\`.
+          ---
+          ${{ env.RELEASE_BODY }}"
+          else
+            gh pr create \
+              --repo "${{ inputs.repository-name }}" \
+              --head "${{ env.PREPARE_BRANCH }}" \
+              --base "main" \
+              --title "Prepare for release ${{ env.VERSION }}" \
+              --label "release-prep,skip-changelog" \
+              --body ":robot: This is a generated PR to update version and changelog in \`build.yaml\`.
+          ---
+          ${{ env.RELEASE_BODY }}"
+          fi

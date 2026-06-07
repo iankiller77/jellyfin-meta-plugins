@@ -1,42 +1,40 @@
 # Configuration for Release Drafter: https://github.com/toolmantim/release-drafter
-name-template: 'Version $NEXT_MAJOR_VERSION'
-# Most plugins within the Jellyfin Org uses a single-digit versioning. Can be replaced by semver: $MAJOR.$MINOR.$PATCH
-# https://github.com/release-drafter/release-drafter#next-version-variables
-tag-template: 'v$NEXT_MAJOR_VERSION'
-version-template: '$MAJOR'
+
+name-template: 'Version $NEXT_MINOR_VERSION'
+tag-template: 'v$NEXT_MINOR_VERSION'
+version-template: '$MAJOR.$MINOR.$PATCH'
+
 category-template: '### $TITLE'
 
 # Emoji reference: https://gitmoji.carloscuesta.me/
+
 categories:
   - title: ':boom: Breaking changes'
     labels:
       - breaking
-  - title: ':fire: Removed'
-    labels:
-      - removed
-  - title: ':rewind: Reverted Changes'
-    labels:
-      - revert
-      - reverted
   - title: ':rocket: Major features and improvements'
     labels:
       - major-enhancement
       - major-feature
-  - title: ':ambulance: Major bug fixes'
-    labels:
-      - major-bug
-  - title: ':wastebasket:️ Deprecated'
-    label: deprecated
   - title: ':tada: New features and improvements'
     labels:
       - enhancement
       - feature
+  - title: ':ambulance: Major bug fixes'
+    labels:
+      - major-bug
   - title: ':bug: Bug Fixes'
     labels:
       - bug
       - fix
       - bugfix
       - regression
+  - title: ':wastebasket:️ Deprecated'
+    label: deprecated
+  - title: ':rewind: Reverted Changes'
+    labels:
+      - revert
+      - reverted
   - title: ':white_check_mark: Tests'
     labels:
       - test
@@ -50,12 +48,13 @@ categories:
       - documentation
   - title: ':arrow_up: Dependency updates'
     labels:
-      - dependencies # Default label used by Dependabot
+      - dependencies
       - dependency
   - title: ':construction_worker: CI & build changes'
     labels:
       - ci
       - build
+
 exclude-labels:
   - no-changelog
   - skip-changelog
@@ -86,6 +85,33 @@ autolabeler:
   - label: feature
     branch:
       - '/feature\/.+/'
+  - label: breaking
+    branch:
+      - '/breaking\/.+/'
+    title:
+      - '/breaking/i'
+  - label: major-feature
+    branch:
+      - '/major\/.+/'
+    title:
+      - '/major/i'
+
+version-resolver:
+  major:
+    labels:
+      - breaking
+  minor:
+    labels:
+      - major-enhancement
+      - major-feature
+  patch:
+    labels:
+      - enhancement
+      - feature
+      - bug
+      - fix
+      - bugfix
+  default: patch
 
 template: |-
   <!-- Optional: add a release summary here -->
@@ -94,4 +120,3 @@ template: |-
   ## :sparkles: What's New
 
   $CHANGES
-
