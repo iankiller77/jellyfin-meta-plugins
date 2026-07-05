@@ -88,7 +88,11 @@ jobs:
           echo "${{ steps.draft.outputs.body }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-          echo "ABI_VERSION=$(curl -s https://api.jellyfin.org/openapi/jellyfin-openapi-stable.json | jq -r '.info.version').0" >> $GITHUB_ENV
+          # Use the last fully-released (non-RC) Jellyfin tag rather than the "stable"
+          # OpenAPI spec, which tracks the next release branch and can report an
+          # unreleased version while it's still in RC.
+          LATEST=$(curl -s https://api.github.com/repos/jellyfin/jellyfin/releases | jq -r '[.[] | select(.prerelease==false)][0].tag_name' | sed 's/^v//')
+          echo "ABI_VERSION=${LATEST}.0" >> $GITHUB_ENV
 
       - name: Update Release Draft
         env:

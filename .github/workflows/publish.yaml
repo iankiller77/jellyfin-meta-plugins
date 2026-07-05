@@ -139,5 +139,6 @@ jobs:
               --head "update-manifest-${{ inputs.version }}" \
               --base "main" \
               --title "Update manifest for ${{ inputs.version }}" \
+              --label "skip-changelog" \
               --body ":robot: This is a generated PR to update \`manifest.json\` for release ${{ inputs.version }}."
           fi
