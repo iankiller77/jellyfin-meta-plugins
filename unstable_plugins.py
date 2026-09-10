@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Create unstable branches for Jellyfin plugin submodules."""
 import argparse
+import base64
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import traceback
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent
@@ -17,6 +22,8 @@ PR_TITLE = "Unstable: Update to latest Jellyfin preview packages"
 MAX_FIX_ITERATIONS = 10
 IS_CI = os.environ.get("CI", "").lower() == "true"
 ERROR_LOG_MAX_LINES = 200
+
+MERGE_CONFLICTS = []
 
 _RE_JELLYFIN_PKG = re.compile(
     r'(PackageReference\s[^>]*Include="Jellyfin\.[^"]*"[^>]*Version=")(\d+)\.\*-\*(")'
@@ -48,20 +55,89 @@ def ensure_nuget_source():
         )
 
 
+def _feed_token():
+    for var in ("NUGET_AUTH_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        if os.environ.get(var):
+            return os.environ[var]
+    configs = [
+        Path.home() / ".nuget" / "NuGet" / "NuGet.Config",
+        REPO_ROOT / "NuGet.Config",
+        REPO_ROOT / "nuget.config",
+    ]
+    for cfg in configs:
+        if not cfg.is_file():
+            continue
+        try:
+            root = ET.parse(cfg).getroot()
+        except ET.ParseError:
+            continue
+        for entry in root.findall(f"./packageSourceCredentials/{NUGET_SOURCE_NAME}/add"):
+            if entry.get("key") == "ClearTextPassword" and entry.get("value"):
+                return entry.get("value")
+    return get_output(["gh", "auth", "token"], check=False) or None
+
+
+def _feed_get(url, token):
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    if token:
+        credential = base64.b64encode(f"jellyfin-bot:{token}".encode()).decode()
+        request.add_header("Authorization", f"Basic {credential}")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace").strip()
+        hint = ""
+        if e.code == 401:
+            hint = (
+                "\nThe feed rejected the credential outright. GitHub Packages accepts"
+                "\nonly a classic PAT (fine-grained tokens always 401 here), and it must"
+                "\nbe unexpired and SSO-authorized for the jellyfin org."
+            )
+        elif e.code == 403:
+            hint = "\nThe credential is valid but lacks the 'read:packages' scope."
+        raise RuntimeError(
+            f"GET {url} failed: HTTP {e.code} {e.reason}{hint}\n{body}"
+        ) from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"GET {url} failed: {e.reason}") from None
+
+
+def _version_key(version):
+    core, _, prerelease = version.partition("-")
+    core = core.split("+")[0]
+    prerelease = prerelease.split("+")[0]
+    numbers = [int(p) if p.isdigit() else 0 for p in core.split(".")]
+    numbers += [0] * (4 - len(numbers))
+    if not prerelease:
+        return (numbers, 1, [])
+    identifiers = [
+        (0, int(i), "") if i.isdigit() else (1, 0, i)
+        for i in prerelease.split(".")
+    ]
+    return (numbers, 0, identifiers)
+
+
 def discover_version():
-    result = subprocess.run(
-        ["dotnet", "package", "search", "Jellyfin.Controller",
-         "--source", NUGET_SOURCE_NAME,
-         "--prerelease", "--take", "1", "--format", "json"],
-        capture_output=True, text=True, check=True,
+    package_id = "Jellyfin.Controller"
+    token = _feed_token()
+    index = _feed_get(NUGET_SOURCE_URL, token)
+    base_address = next(
+        (r["@id"] for r in index.get("resources", [])
+         if r.get("@type", "").startswith("PackageBaseAddress")),
+        None,
     )
-    data = json.loads(result.stdout)
-    packages = data["searchResult"][0]["packages"]
-    if not packages:
-        raise RuntimeError("Jellyfin.Controller not found in jellyfin-pre feed")
-    version = packages[0]["latestVersion"]
+    if not base_address:
+        raise RuntimeError(
+            f"{NUGET_SOURCE_NAME} feed exposes no PackageBaseAddress resource"
+        )
+    url = f"{base_address.rstrip('/')}/{package_id.lower()}/index.json"
+    versions = _feed_get(url, token).get("versions") or []
+    if not versions:
+        raise RuntimeError(f"{package_id} not found in {NUGET_SOURCE_NAME} feed")
+    version = max(versions, key=_version_key)
     parts = version.split(".")
-    return int(parts[0]), int(parts[1]), _get_tfm("Jellyfin.Controller", version)
+    return int(parts[0]), int(parts[1]), _get_tfm(package_id, version)
 
 
 def _get_tfm(package_id, version):
@@ -117,21 +193,39 @@ def init_submodule(name):
     run(["git", "submodule", "update", "--init", name], cwd=REPO_ROOT)
 
 
+def owner_repo(plugin_dir):
+    return f"jellyfin/{plugin_dir.name}"
+
+
 def check_unstable(plugin_dir):
     run(["git", "fetch", "origin"], cwd=plugin_dir)
     branch_exists = bool(
         get_output(["git", "ls-remote", "--heads", "origin", UNSTABLE_BRANCH], cwd=plugin_dir)
     )
-    repo = get_output(
-        ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
-        cwd=plugin_dir,
-    )
+    repo = owner_repo(plugin_dir)
     pr_url = get_output(
         ["gh", "pr", "list", "--repo", repo, "--head", UNSTABLE_BRANCH,
          "--state", "open", "--json", "url", "-q", ".[0].url // empty"],
         cwd=plugin_dir, check=False,
     ) or None
     return branch_exists, pr_url, repo
+
+
+def merge_master(plugin_dir):
+    result = subprocess.run(
+        ["git", "merge", "origin/master"], cwd=plugin_dir, capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return True
+    print(result.stdout + result.stderr, file=sys.stderr)
+    run(["git", "merge", "--abort"], cwd=plugin_dir, check=False)
+    return False
+
+
+def branch_moved(plugin_dir):
+    head = get_output(["git", "rev-parse", "HEAD"], cwd=plugin_dir)
+    remote = get_output(["git", "rev-parse", f"origin/{UNSTABLE_BRANCH}"], cwd=plugin_dir)
+    return head != remote
 
 
 def update_jellyfin_packages(plugin_dir, new_major):
@@ -238,12 +332,14 @@ def commit_push(plugin_dir, failing=False):
     if not has_changes:
         commit_cmd.append("--allow-empty")
     run(commit_cmd, cwd=plugin_dir)
-    ssh_url = get_output(
-        ["gh", "repo", "view", "--json", "sshUrl", "-q", ".sshUrl"], cwd=plugin_dir
-    )
+    push_branch(plugin_dir)
+    return True
+
+
+def push_branch(plugin_dir):
+    ssh_url = f"git@github.com:{owner_repo(plugin_dir)}.git"
     run(["git", "remote", "set-url", "origin", ssh_url], cwd=plugin_dir)
     run(["git", "push", "origin", UNSTABLE_BRANCH, "--force-with-lease"], cwd=plugin_dir)
-    return True
 
 
 def _format_errors_section(errors):
@@ -258,9 +354,20 @@ def _format_errors_section(errors):
     return f"\n\n## Build errors{note}\n\n```\n{body}\n```\n"
 
 
-def _build_pr_body(new_major, errors=None):
+def _format_merge_section(merge_conflict):
+    if not merge_conflict:
+        return ""
+    return (
+        "\n\n## Merge conflict\n\n"
+        "Merging `master` into this branch failed with conflicts, so it is still "
+        "based on an older `master`. Resolve the conflicts and update the branch manually.\n"
+    )
+
+
+def _build_pr_body(new_major, errors=None, merge_conflict=False):
     return (
         f"Update Jellyfin NuGet package version to `{new_major}.*-*`."
+        + _format_merge_section(merge_conflict)
         + _format_errors_section(errors)
     )
 
@@ -277,8 +384,19 @@ def create_pr(plugin_dir, repo, new_major, errors=None):
     ], cwd=plugin_dir)
 
 
-def update_pr_body(plugin_dir, pr_url, body):
-    run(["gh", "pr", "edit", pr_url, "--body", body], cwd=plugin_dir)
+def _comment_body(new_major, errors=None, merge_conflict=False, reason=None):
+    lines = []
+    if errors:
+        lines.append(_format_errors_section(errors).strip())
+    if merge_conflict:
+        lines.append(_format_merge_section(merge_conflict).strip())
+    if reason:
+        lines.append(f"`{reason}`")
+    return "\n\n".join(lines)
+
+
+def comment_pr(plugin_dir, pr_url, body):
+    run(["gh", "pr", "comment", pr_url, "--body", body], cwd=plugin_dir)
 
 
 def process_plugin(plugin_dir, new_major, new_minor, tfm):
@@ -287,10 +405,19 @@ def process_plugin(plugin_dir, new_major, new_minor, tfm):
 
     init_submodule(name)
     branch_exists, pr_url, repo = check_unstable(plugin_dir)
+    merge_conflict = False
+    merged = False
 
     if branch_exists and pr_url:
         print(f"  Updating existing PR: {pr_url}")
         run(["git", "checkout", "-f", "-B", UNSTABLE_BRANCH, f"origin/{UNSTABLE_BRANCH}"], cwd=plugin_dir)
+        print("  Merging master...")
+        if merge_master(plugin_dir):
+            merged = branch_moved(plugin_dir)
+        else:
+            print("  Merge conflicted; continuing without merging", file=sys.stderr)
+            MERGE_CONFLICTS.append(name)
+            merge_conflict = True
     else:
         if branch_exists:
             print("  Deleting stale unstable branch")
@@ -310,7 +437,9 @@ def process_plugin(plugin_dir, new_major, new_minor, tfm):
     if not ok:
         print(errors, file=sys.stderr)
         if IS_CI:
-            return _push_failing(plugin_dir, repo, new_major, pr_url, errors, "restore failed")
+            return _push_failing(
+                plugin_dir, repo, new_major, pr_url, errors, "restore failed", merge_conflict
+            )
         return "error", "restore failed"
 
     print("  Building...")
@@ -318,29 +447,41 @@ def process_plugin(plugin_dir, new_major, new_minor, tfm):
     if not ok:
         print(errors, file=sys.stderr)
         if IS_CI:
-            return _push_failing(plugin_dir, repo, new_major, pr_url, errors, "build failed")
+            return _push_failing(
+                plugin_dir, repo, new_major, pr_url, errors, "build failed", merge_conflict
+            )
         return "error", "build failed"
     print("  Build succeeded.")
 
-    if not commit_push(plugin_dir):
-        return "built", None
+    committed = commit_push(plugin_dir)
+    if not committed and merged:
+        print("  Pushing merged branch...")
+        push_branch(plugin_dir)
 
     if pr_url:
-        update_pr_body(plugin_dir, pr_url, _build_pr_body(new_major))
-        return "updated", pr_url
+        if merge_conflict:
+            print("  Commenting on merge conflict...")
+            comment_pr(plugin_dir, pr_url, _comment_body(new_major, merge_conflict=True))
+        if committed:
+            return "updated", pr_url
+        return ("merged" if merged else "built"), pr_url
+
+    if not committed:
+        return "built", None
 
     new_pr = create_pr(plugin_dir, repo, new_major)
     print(f"  Created PR: {new_pr}")
     return "created", new_pr
 
 
-def _push_failing(plugin_dir, repo, new_major, pr_url, errors, reason):
-    del reason  # commit_push(failing=True) always pushes (empty commit if needed)
+def _push_failing(plugin_dir, repo, new_major, pr_url, errors, reason, merge_conflict=False):
     commit_push(plugin_dir, failing=True)
-    body = _build_pr_body(new_major, errors)
     if pr_url:
-        update_pr_body(plugin_dir, pr_url, body)
-        print(f"  Pushed [build-failing] commit to existing PR: {pr_url}")
+        comment_pr(
+            plugin_dir, pr_url,
+            _comment_body(new_major, errors=errors, reason=reason, merge_conflict=merge_conflict),
+        )
+        print(f"  Pushed [build-failing] commit and commented on existing PR: {pr_url}")
         return "pushed_failing", pr_url
     new_pr = create_pr(plugin_dir, repo, new_major, errors=errors)
     print(f"  Created [build-failing] PR: {new_pr}")
@@ -367,19 +508,25 @@ def main():
     new_major, new_minor, tfm = discover_version()
     print(f"Target Jellyfin version: {new_major}.{new_minor} ({tfm})")
 
-    results = {"created": [], "updated": [], "built": [], "pushed_failing": [], "error": []}
+    results = {
+        "created": [], "updated": [], "merged": [], "built": [], "pushed_failing": [], "error": []
+    }
 
     for plugin_dir in plugins:
         try:
             status, detail = process_plugin(plugin_dir, new_major, new_minor, tfm)
         except subprocess.CalledProcessError as e:
             status, detail = "error", str(e)
+        except Exception as e:
+            traceback.print_exc()
+            status, detail = "error", f"{type(e).__name__}: {e}"
         results[status].append((plugin_dir.name, detail))
 
     print(f"\n{'=' * 60}\nSummary\n{'=' * 60}")
     for label, key in [
         ("PRs created", "created"),
         ("PRs updated", "updated"),
+        ("Merged master (no other changes)", "merged"),
         ("Built (no changes)", "built"),
         ("Pushed with failing build", "pushed_failing"),
         ("Errors", "error"),
@@ -388,6 +535,11 @@ def main():
             print(f"\n{label}:")
             for name, detail in results[key]:
                 print(f"  {name}" + (f": {detail}" if detail else ""))
+
+    if MERGE_CONFLICTS:
+        print("\nMerge of master conflicted (resolve manually):")
+        for name in MERGE_CONFLICTS:
+            print(f"  {name}")
 
 
 if __name__ == "__main__":
